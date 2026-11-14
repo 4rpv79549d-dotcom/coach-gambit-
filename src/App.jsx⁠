@@ -1,0 +1,601 @@
+import React, { useState, useMemo, useEffect, useRef } from "react";
+import { Search, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Send, ArrowLeft, Crown, Loader2, AlertTriangle, Sparkles, Clock, Play, Volume2, VolumeX } from "lucide-react";
+
+/* ───────── Мини-шахматный движок: разбор PGN без внешних библиотек ───────── */
+const N_D = [[1,2],[2,1],[-1,2],[-2,1],[1,-2],[2,-1],[-1,-2],[-2,-1]];
+const K_D = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+const ROOK = [[1,0],[-1,0],[0,1],[0,-1]], BISH = [[1,1],[1,-1],[-1,1],[-1,-1]];
+const white = (p) => p === p.toUpperCase();
+const initial = () =>
+  "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR".replace(/\//g, "").replace(/\d/g, (n) => " ".repeat(+n))
+    .split("").map((c) => (c === " " ? null : c));
+
+function attacked(b, sq, by) {
+  const r = sq >> 3, c = sq & 7;
+  const get = (rr, cc) => (rr < 0 || rr > 7 || cc < 0 || cc > 7 ? null : b[rr * 8 + cc]);
+  const is = (p, t) => p && p.toUpperCase() === t && white(p) === (by === "w");
+  const pr = by === "w" ? r + 1 : r - 1;
+  if (is(get(pr, c - 1), "P") || is(get(pr, c + 1), "P")) return true;
+  for (const [a, d] of N_D) if (is(get(r + a, c + d), "N")) return true;
+  for (const [a, d] of K_D) if (is(get(r + a, c + d), "K")) return true;
+  for (const [dirs, t] of [[ROOK, "R"], [BISH, "B"]])
+    for (const [a, d] of dirs) {
+      let rr = r + a, cc = c + d;
+      while (rr >= 0 && rr < 8 && cc >= 0 && cc < 8) {
+        const p = b[rr * 8 + cc];
+        if (p) { if (is(p, t) || is(p, "Q")) return true; break; }
+        rr += a; cc += d;
+      }
+    }
+  return false;
+}
+
+function reach(b, f, t, ep) {
+  const p = b[f], q = b[t];
+  if (q && white(q) === white(p)) return false;
+  const fr = f >> 3, fc = f & 7, tr = t >> 3, tc = t & 7, dr = tr - fr, dc = tc - fc, T = p.toUpperCase();
+  if (T === "N") return Math.abs(dr) * Math.abs(dc) === 2;
+  if (T === "K") return Math.max(Math.abs(dr), Math.abs(dc)) === 1;
+  if (T === "P") {
+    const dir = white(p) ? -1 : 1, start = white(p) ? 6 : 1;
+    if (dc === 0) return !q && (dr === dir || (dr === 2 * dir && fr === start && !b[(fr + dir) * 8 + fc]));
+    return Math.abs(dc) === 1 && dr === dir && (!!q || t === ep);
+  }
+  const diag = Math.abs(dr) === Math.abs(dc), orth = dr === 0 || dc === 0;
+  if ((dr === 0 && dc === 0) || !(T === "B" ? diag : T === "R" ? orth : diag || orth)) return false;
+  const sr = Math.sign(dr), sc = Math.sign(dc);
+  for (let r = fr + sr, c = fc + sc; r !== tr || c !== tc; r += sr, c += sc) if (b[r * 8 + c]) return false;
+  return true;
+}
+
+function play(s, san) {
+  const b = [...s.b], w = s.turn === "w", next = w ? "b" : "w";
+  const clean = san.replace(/[+#!?]/g, "");
+  if (/^[O0]-[O0](-[O0])?$/.test(clean)) {
+    const long = clean.length > 3, row = w ? 7 : 0, from = row * 8 + 4, to = row * 8 + (long ? 2 : 6);
+    b[to] = b[from]; b[from] = null;
+    const rf = row * 8 + (long ? 0 : 7), rt = row * 8 + (long ? 3 : 5);
+    b[rt] = b[rf]; b[rf] = null;
+    return { b, turn: next, ep: null, mv: [from, to], cap: false };
+  }
+  const m = clean.match(/^([KQRBN])?([a-h])?([1-8])?(x)?([a-h][1-8])(?:=?([QRBN]))?$/);
+  if (!m) throw new Error("bad san");
+  const [, pc = "P", fcH, frH, , tsq, promo] = m;
+  const to = (8 - +tsq[1]) * 8 + "abcdefgh".indexOf(tsq[0]);
+  const me = w ? pc : pc.toLowerCase();
+  let from = -1;
+  for (let i = 0; i < 64 && from < 0; i++) {
+    if (b[i] !== me) continue;
+    if (fcH && "abcdefgh"[i & 7] !== fcH) continue;
+    if (frH && 8 - (i >> 3) !== +frH) continue;
+    if (!reach(b, i, to, s.ep)) continue;
+    const nb = [...b]; nb[to] = nb[i]; nb[i] = null;
+    if (pc === "P" && to === s.ep && (i & 7) !== (to & 7)) nb[(i >> 3) * 8 + (to & 7)] = null;
+    if (!attacked(nb, nb.indexOf(w ? "K" : "k"), next)) from = i;
+  }
+  if (from < 0) throw new Error("illegal");
+  const isEp = pc === "P" && to === s.ep && (from & 7) !== (to & 7);
+  const cap = !!b[to] || isEp;
+  if (isEp) b[(from >> 3) * 8 + (to & 7)] = null;
+  b[to] = promo ? (w ? promo : promo.toLowerCase()) : b[from];
+  b[from] = null;
+  const ep = pc === "P" && Math.abs((to >> 3) - (from >> 3)) === 2 ? (from + to) / 2 : null;
+  return { b, turn: next, ep, mv: [from, to], cap };
+}
+
+function build(pgn) {
+  const body = pgn.replace(/\[[^\]]*\]/g, "").replace(/\{[^}]*\}/g, "").replace(/\([^)]*\)/g, "")
+    .replace(/\$\d+/g, "").replace(/\d+\.+/g, " ");
+  const toks = body.split(/\s+/).filter((t) => t && !/^(1-0|0-1|1\/2-1\/2|\*)$/.test(t));
+  let s = { b: initial(), turn: "w", ep: null, mv: null };
+  const out = [{ s, san: null }];
+  for (const t of toks) { try { s = play(s, t); out.push({ s, san: t }); } catch { break; } }
+  return out;
+}
+
+const headers = (pgn) => Object.fromEntries([...pgn.matchAll(/\[(\w+)\s+"([^"]*)"\]/g)].map((m) => [m[1], m[2]]));
+const openingName = (pgn) => {
+  const u = headers(pgn).ECOUrl; if (!u) return "";
+  const segs = u.split("/").pop().split("-"), i = segs.findIndex((x) => /^\d/.test(x));
+  return (i < 0 ? segs : segs.slice(0, i)).join(" ");
+};
+const VAL = { p: 1, n: 3, b: 3, r: 5, q: 9 };
+const material = (b) => b.reduce((a, p) => (p && VAL[p.toLowerCase()] ? a + (white(p) ? 1 : -1) * VAL[p.toLowerCase()] : a), 0);
+
+/* ───────── Локализация интерфейса ───────── */
+const TXT = {
+  ru: {
+    locale: "ru-RU", title: "Тренер Гамбит", sub: "Разбор ваших партий с Chess.com",
+    nick: "Ник на Chess.com", ph: "например, ваш_ник", find: "Найти партии",
+    demo: "Открыть демо-партию (Опера, 1858)", recent: "Последние партии", none: "В последнем месяце партий нет.",
+    back: "К списку партий", prev: "Назад", next: "Вперёд", first: "В начало", last: "В конец",
+    startLbl: "Старт", moveLbl: (n, s) => `Ход ${n}: ${s}`,
+    ask: "Спросите тренера…", send: "Отправить", think: "Гамбит думает…",
+    chips: { opening: "Что с дебютом?", mistake: "Это ошибка?", eval: "Оцени позицию", plan: "Что дальше?" },
+    res: { win: "Победа", loss: "Поражение", draw: "Ничья" },
+    e: {
+      notFound: "Игрок не найден. Проверьте ник.",
+      api: (s) => `Chess.com ответил ошибкой ${s}.`,
+      none: "У этого игрока пока нет сыгранных партий.",
+      net: "Не удалось связаться с Chess.com — в превью сеть может быть закрыта. Попробуйте демо-партию.",
+    },
+    soundOn: "Выключить звук", soundOff: "Включить звук", soundNo: "Озвучка не поддерживается на этом устройстве",
+    soundHello: "Звук включён. Буду озвучивать свои комментарии.",
+    listen: "Озвучить сообщение", stop: "Остановить озвучку", langAria: "Язык интерфейса",
+  },
+  en: {
+    locale: "en-GB", title: "Coach Gambit", sub: "Review your Chess.com games",
+    nick: "Chess.com username", ph: "e.g. your_username", find: "Find games",
+    demo: "Open demo game (Opera Game, 1858)", recent: "Recent games", none: "No games in the latest month.",
+    back: "Back to games", prev: "Back", next: "Next", first: "To start", last: "To end",
+    startLbl: "Start", moveLbl: (n, s) => `Move ${n}: ${s}`,
+    ask: "Ask the coach…", send: "Send", think: "Gambit is thinking…",
+    chips: { opening: "What about the opening?", mistake: "Was that a mistake?", eval: "Evaluate the position", plan: "What next?" },
+    res: { win: "Win", loss: "Loss", draw: "Draw" },
+    e: {
+      notFound: "Player not found. Check the username.",
+      api: (s) => `Chess.com returned error ${s}.`,
+      none: "This player has no games yet.",
+      net: "Couldn't reach Chess.com — the network may be blocked in the preview. Try the demo game.",
+    },
+    soundOn: "Turn sound off", soundOff: "Turn sound on", soundNo: "Speech is not supported on this device",
+    soundHello: "Sound on. I'll read my comments aloud.",
+    listen: "Read message aloud", stop: "Stop reading", langAria: "Interface language",
+  },
+};
+
+/* ───────── Характер тренера (RU / EN) ───────── */
+const pick = (a, k) => a[k % a.length];
+const x = (l, ru, en) => (l === "ru" ? ru : en);
+const PIECE_ACC = {
+  ru: { q: "ферзя", r: "ладью", b: "слона", n: "коня", p: "пешку" },
+  en: { q: "the queen", r: "a rook", b: "a bishop", n: "a knight", p: "a pawn" },
+};
+const POOL = {
+  N: [
+    { ru: "Конь прыгнул — и сразу видно, что кто-то любит вилки.", en: "A knight jumps in — someone clearly loves a good fork." },
+    { ru: "Конь на новом поле. Главное, чтобы не в гости к чужой пешке.", en: "Knight on a new square. Just make sure it's not walking into a pawn's reach." },
+  ],
+  B: [
+    { ru: "Слон вышел на диагональ. Диагонали любят тех, кто не торопится.", en: "Bishop on the diagonal. Diagonals reward the patient." },
+    { ru: "Слон ожил. Вашему королю стало чуть спокойнее.", en: "The bishop wakes up. Your king can breathe a little easier." },
+  ],
+  R: [
+    { ru: "Ладья заняла линию. Тяжёлая артиллерия подтягивается.", en: "Rook takes the file. The heavy artillery is arriving." },
+    { ru: "Ладьи любят открытые линии, а вы их, похоже, тоже.", en: "Rooks love open files, and so, apparently, do you." },
+  ],
+  Q: [
+    { ru: "Ферзь в деле. Рановато или вовремя — решает позиция, а не азарт.", en: "The queen steps out. Too early or right on time — the position decides, not enthusiasm." },
+    { ru: "Ферзь гуляет сам по себе. Смелое решение, держим кулаки.", en: "The queen goes for a stroll. Bold choice — fingers crossed." },
+  ],
+  K: [
+    { ru: "Король шагнул сам. Либо расчёт, либо отвага — проверим следующим ходом.", en: "The king steps out himself. Either calculation or bravery — we'll see next move." },
+    { ru: "Королю пришлось пройтись. Надеюсь, он знает, что делает.", en: "The king takes a walk. Let's hope he knows what he's doing." },
+  ],
+  P: [
+    { ru: "Пешка вперёд. Назад она, как известно, не ходит — как и мои комплименты.", en: "Pawn forward. It never goes back — much like my compliments." },
+    { ru: "Тихий пешечный ход. Из таких и строятся позиции.", en: "A quiet pawn move. Positions are built from these." },
+    { ru: "Пешечная структура меняется. Запомните этот момент.", en: "The pawn structure shifts. Remember this moment." },
+  ],
+};
+
+function remark(pos, i, l) {
+  const { san, s } = pos[i];
+  if (!san) return x(l, "Начальная позиция. Тут пока никто не ошибся — наслаждайтесь.", "Starting position. Nobody has blundered yet — enjoy it.");
+  const side = i % 2 ? x(l, "Белые", "White") : x(l, "Чёрные", "Black");
+  if (san.includes("#")) return x(l, `Мат. ${side} ставят точку, остальное — лирика.`, `Checkmate. ${side} put the full stop on it; the rest is poetry.`);
+  if (san.startsWith("O-O")) return x(l, `${side} рокируются. Король убрался с дороги — признак здравого смысла.`, `${side} castle. The king gets out of the way — a sign of good sense.`);
+  if (san.includes("=")) return x(l, `Превращение! ${side} получили вторую жизнь, как в аркаде.`, `Promotion! ${side} get a second life, arcade style.`);
+  const taken = s.cap && pos[i - 1].s.b[s.mv[1]];
+  if (taken && taken.toLowerCase() === "q") return x(l, "Ферзь снят с доски. Это либо гениально, либо очень больно.", "The queen comes off the board. Either genius or very painful.");
+  if (san.includes("+")) return x(l, `Шах! ${side} напоминают королю, что он не в отпуске.`, `Check! ${side} remind the king he's not on holiday.`);
+  if (taken) return x(l, `Размен. Забрали ${PIECE_ACC.ru[taken.toLowerCase()] || "фигуру"}. Проверьте, не осталось ли что-то под боем.`, `A capture — they took ${PIECE_ACC.en[taken.toLowerCase()] || "a piece"}. Check whether anything is left hanging.`);
+  if (i === 1) {
+    if (san === "e4") return x(l, "1.e4 — классика, как утренний кофе: просто и бодрит.", "1.e4 — the classic. Like morning coffee: simple and invigorating.");
+    if (san === "d4") return x(l, "1.d4 — любите, когда всё под контролем? Уважаю.", "1.d4 — fond of having things under control? Respect.");
+    return x(l, `1.${san} — нестандартно. Или вы хотели сломать теорию, или она вас.`, `1.${san} — unusual. Either you're breaking theory, or it's about to break you.`);
+  }
+  return pick(POOL[san[0] in POOL ? san[0] : "P"], i)[l];
+}
+
+function greet(op, l) {
+  return op
+    ? x(l, `Играем «${op}»? Люблю, когда игроки начинают с идеей. Листайте ходы — буду комментировать.`, `Playing the ${op}? I like players who start with an idea. Step through the moves — I'll comment.`)
+    : x(l, "Партия загружена. Листайте ходы, а я буду комментировать и подкалывать.", "Game loaded. Step through the moves and I'll comment — and tease.");
+}
+
+function classify(q) {
+  const t = q.toLowerCase();
+  if (/дебют|opening/.test(t)) return "opening";
+  if (/ошиб|зевок|плох|blunder|mistake|wrong|bad/.test(t)) return "mistake";
+  if (/оцен|позици|лучше|материал|eval|position|better|material|winning/.test(t)) return "eval";
+  if (/дальше|совет|план|что делать|next|advice|plan|what should/.test(t)) return "plan";
+  return "other";
+}
+
+function reply(intent, pos, i, opening, k, l) {
+  if (intent === "opening")
+    return opening
+      ? x(l, `Дебют — «${opening}». Теорию знать полезно, но понимать идеи полезнее: куда идут фигуры и зачем.`, `The opening is the ${opening}. Knowing theory helps, but understanding the ideas helps more: where the pieces go, and why.`)
+      : x(l, "Дебют определяется по первым ходам, а здесь заголовок партии молчит. Смотрите на развитие фигур и центр.", "The game header doesn't name the opening, so judge it by piece development and the centre.");
+  if (intent === "mistake")
+    return pick([
+      x(l, "Я бы ткнул в момент, где вы торопились. Пролистайте на пару ходов назад — найдёте сами.", "I'd poke at the moment you were rushing. Step back a couple of moves — you'll spot it yourself."),
+      x(l, "Ошибки любят размены, после которых забывают про шах. Проверьте каждое взятие.", "Mistakes love exchanges where everyone forgets about a check. Re-check every capture."),
+    ], k);
+  if (intent === "eval") {
+    const m = material(pos[i].s.b);
+    if (m === 0) return x(l, "Материал равный. Значит, всё решат планы и нервы.", "Material is equal. So plans and nerves will decide.");
+    const who = m > 0 ? x(l, "белые", "White") : x(l, "чёрные", "Black");
+    return x(l, `Материал: ${who} впереди на ${Math.abs(m)}. Но счёт — не приговор, если король соперника без укрытия.`, `Material: ${who} is ahead by ${Math.abs(m)}. But the count isn't a verdict if the opposing king has no shelter.`);
+  }
+  if (intent === "plan")
+    return pick([
+      x(l, "Улучшайте худшую фигуру. Скучно, но работает в девяти партиях из десяти.", "Improve your worst piece. Boring, but it works in nine games out of ten."),
+      x(l, "Проверьте шахи, взятия и угрозы — в таком порядке. Потом ходите.", "Check checks, captures and threats — in that order. Then move."),
+    ], k);
+  const san = pos[i].san;
+  return pick([
+    x(l, `Интересный вопрос. А вы сами что думаете о ходе ${san || "в начальной позиции"}?`, `Interesting question. What do you think of ${san ? "the move " + san : "the starting position"} yourself?`),
+    x(l, "Хмм… Я бы сначала посмотрел, какие фигуры у вас ещё не играют.", "Hmm… I'd first look at which of your pieces aren't playing yet."),
+    x(l, "Давайте разберём по ходам. Листайте — я буду подкалывать.", "Let's go move by move. Keep stepping — I'll keep teasing."),
+  ], k);
+}
+
+/* ───────── Озвучка (Web Speech API) ───────── */
+const canSpeak = typeof window !== "undefined" && "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
+
+function pickVoice(l) {
+  const vs = window.speechSynthesis.getVoices();
+  const n = (v) => v.lang.replace("_", "-").toLowerCase();
+  if (l === "ru") return vs.find((v) => n(v) === "ru-ru") || vs.find((v) => n(v).startsWith("ru"));
+  return vs.find((v) => n(v) === "en-gb") || vs.find((v) => n(v) === "en-us") || vs.find((v) => n(v).startsWith("en"));
+}
+
+/* ───────── Доска ───────── */
+const GLYPH = { k: "♚", q: "♛", r: "♜", b: "♝", n: "♞", p: "♟" };
+function Board({ s, flip }) {
+  const kSq = s.b.indexOf(s.turn === "w" ? "K" : "k");
+  const inCheck = kSq >= 0 && attacked(s.b, kSq, s.turn === "w" ? "b" : "w");
+  const cells = [];
+  for (let d = 0; d < 64; d++) {
+    const r = d >> 3, c = d & 7, idx = flip ? 63 - d : d, p = s.b[idx], px = c * 10, py = r * 10;
+    cells.push(
+      <g key={d}>
+        <rect x={px} y={py} width="10" height="10" fill={(r + c) % 2 ? "#6f80ab" : "#d6dae8"} />
+        {s.mv && s.mv.includes(idx) && <rect x={px} y={py} width="10" height="10" fill="#fbbf24" opacity="0.55" />}
+        {inCheck && idx === kSq && <circle cx={px + 5} cy={py + 5} r="4.6" fill="#ef4444" opacity="0.6" />}
+        {c === 0 && <text x={px + 0.7} y={py + 2.6} fontSize="2.3" fill={(r + c) % 2 ? "#d6dae8" : "#6f80ab"} fontWeight="700">{8 - (idx >> 3)}</text>}
+        {r === 7 && <text x={px + 9.3} y={py + 9.3} fontSize="2.3" textAnchor="end" fill={(r + c) % 2 ? "#d6dae8" : "#6f80ab"} fontWeight="700">{"abcdefgh"[idx & 7]}</text>}
+        {p && (
+          <text x={px + 5} y={py + 7.7} fontSize="8.4" textAnchor="middle" paintOrder="stroke" strokeLinejoin="round"
+            fontFamily="'Segoe UI Symbol','Noto Sans Symbols 2','DejaVu Sans',serif"
+            fill={white(p) ? "#fbf8ef" : "#161820"} stroke={white(p) ? "#14161d" : "#e6e9f4"} strokeWidth={white(p) ? 0.45 : 0.25}>
+            {GLYPH[p.toLowerCase()] + "\uFE0E"}
+          </text>
+        )}
+      </g>
+    );
+  }
+  return <svg viewBox="0 0 80 80" className="w-full rounded-xl block shadow-2xl shadow-black/50">{cells}</svg>;
+}
+
+/* ───────── Приложение ───────── */
+const DEMO = {
+  demo: true, time_class: "demo", end_time: 0,
+  white: { username: "Paul Morphy", rating: "", result: "win" }, black: { username: "Duke & Count", rating: "", result: "checkmated" },
+  pgn: `[Event "Opera Game"]\n[ECOUrl "https://www.chess.com/openings/Philidor-Defense-3.Bc4"]\n1. e4 e5 2. Nf3 d6 3. d4 Bg4 4. dxe5 Bxf3 5. Qxf3 dxe5 6. Bc4 Nf6 7. Qb3 Qe7 8. Nc3 c6 9. Bg5 b5 10. Nxb5 cxb5 11. Bxb5+ Nbd7 12. O-O-O Rd8 13. Rxd7 Rxd7 14. Rd1 Qe6 15. Bxd7+ Nxd7 16. Qb8+ Nxb8 17. Rd8# 1-0`,
+};
+const RES_STYLE = { win: "bg-emerald-500/15 text-emerald-300", loss: "bg-rose-500/15 text-rose-300", draw: "bg-slate-500/20 text-slate-300" };
+
+export default function App() {
+  const [lang, setLang] = useState("ru");
+  const [sound, setSound] = useState(false);
+  const [speakingKey, setSpeakingKey] = useState(null);
+  const [name, setName] = useState("");
+  const [user, setUser] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [games, setGames] = useState(null);
+  const [sel, setSel] = useState(null);
+  const [idx, setIdx] = useState(0);
+  const [chat, setChat] = useState([]);
+  const [input, setInput] = useState("");
+  const [typing, setTyping] = useState(false);
+  const chatRef = useRef(null), movesRef = useRef(null), stepRef = useRef(null);
+
+  const T = TXT[lang];
+  const pos = useMemo(() => (sel ? build(sel.pgn) : []), [sel]);
+  const opening = useMemo(() => (sel ? openingName(sel.pgn) : ""), [sel]);
+  const my = sel && user && sel.black.username.toLowerCase() === user ? "b" : "w";
+  const flip = my === "b";
+
+  /* — озвучка — */
+  useEffect(() => {
+    if (!canSpeak) return;
+    const warm = () => window.speechSynthesis.getVoices();
+    warm();
+    window.speechSynthesis.addEventListener?.("voiceschanged", warm);
+    return () => { window.speechSynthesis.removeEventListener?.("voiceschanged", warm); window.speechSynthesis.cancel(); };
+  }, []);
+
+  function stopSpeech() {
+    if (canSpeak) window.speechSynthesis.cancel();
+    setSpeakingKey(null);
+  }
+  function speak(text, key, l = lang) {
+    if (!canSpeak || !text) return;
+    const ss = window.speechSynthesis;
+    ss.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = l === "ru" ? "ru-RU" : "en-GB";
+    const v = pickVoice(l);
+    if (v) { u.voice = v; u.lang = v.lang; }
+    u.rate = 1; u.pitch = 1;
+    const done = () => setSpeakingKey((k) => (k === key ? null : k));
+    u.onend = done; u.onerror = done;
+    setSpeakingKey(key);
+    ss.speak(u);
+  }
+  // iPhone: «разблокировка» речи внутри жеста пользователя, чтобы ответы с задержкой тоже озвучивались
+  function unlock() {
+    if (!canSpeak) return;
+    const u = new SpeechSynthesisUtterance(" ");
+    u.volume = 0;
+    window.speechSynthesis.speak(u);
+  }
+  function tapSpeak(text, key) {
+    if (speakingKey === key) stopSpeech();
+    else speak(text, key);
+  }
+  function toggleSound() {
+    if (!canSpeak) return;
+    if (sound) { setSound(false); stopSpeech(); }
+    else { setSound(true); speak(T.soundHello, "hello"); }
+  }
+  function changeLang(l) {
+    if (l === lang) return;
+    stopSpeech();
+    setLang(l);
+  }
+
+  /* — данные Chess.com — */
+  const outcome = (g) => {
+    const me = g.white.username.toLowerCase() === user ? g.white : g.black, op = me === g.white ? g.black : g.white;
+    return me.result === "win" ? "win" : op.result === "win" ? "loss" : "draw";
+  };
+
+  async function load() {
+    const u = name.trim().toLowerCase();
+    if (!u) return;
+    setLoading(true); setError(null); setGames(null); setUser(u);
+    try {
+      const r = await fetch(`https://api.chess.com/pub/player/${encodeURIComponent(u)}/games/archives`);
+      if (r.status === 404) throw { k: "notFound" };
+      if (!r.ok) throw { k: "api", s: r.status };
+      const { archives = [] } = await r.json();
+      if (!archives.length) throw { k: "none" };
+      let all = [];
+      for (const url of archives.slice(-2).reverse()) {
+        const res = await fetch(url);
+        const j = await res.json();
+        all = all.concat((j.games || []).filter((g) => g.pgn).reverse());
+        if (all.length >= 10) break;
+      }
+      setGames(all.slice(0, 10));
+    } catch (e) {
+      setError(e && e.k ? e : { k: "net" });
+    } finally { setLoading(false); }
+  }
+
+  function open(g) {
+    const op = openingName(g.pgn);
+    setSel(g); setIdx(0); setInput(""); setTyping(false);
+    setChat([{ f: "coach", kind: "greet", op }]);
+    if (sound) speak(greet(op, lang), "c0");
+  }
+
+  /* — навигация по ходам (озвучка запускается прямо в обработчике нажатия) — */
+  function go(i) {
+    const j = Math.max(0, Math.min(pos.length - 1, i));
+    if (j === idx) return;
+    setIdx(j);
+    if (sound) speak(remark(pos, j, lang), "live");
+  }
+  stepRef.current = (d) => go(idx + d);
+  useEffect(() => {
+    if (!sel) return;
+    const h = (e) => {
+      if (e.target.tagName === "INPUT") return;
+      if (e.key === "ArrowLeft") stepRef.current(-1);
+      if (e.key === "ArrowRight") stepRef.current(1);
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [sel]);
+  useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight; }, [chat, typing]);
+  useEffect(() => {
+    const el = movesRef.current?.querySelector(`[data-i="${idx}"]`);
+    if (el) movesRef.current.scrollLeft = el.offsetLeft - movesRef.current.clientWidth / 2;
+  }, [idx, sel]);
+
+  /* — чат — */
+  const coachText = (m) => (m.kind === "greet" ? greet(m.op, lang) : reply(m.intent, pos, m.at, opening, m.k, lang));
+
+  function send(text, intent) {
+    const q = text.trim();
+    if (!q || typing) return;
+    const msg = { f: "coach", kind: "reply", intent: intent || classify(q), k: chat.length, at: idx };
+    const key = `c${chat.length + 1}`;
+    setChat((c) => [...c, { f: "me", t: q }]);
+    setInput(""); setTyping(true);
+    if (sound) unlock();
+    setTimeout(() => {
+      setChat((c) => [...c, msg]);
+      setTyping(false);
+      if (sound) speak(reply(msg.intent, pos, msg.at, opening, msg.k, lang), key);
+    }, 700);
+  }
+
+  const SpeakBtn = ({ text, k, big }) =>
+    canSpeak ? (
+      <button onClick={() => tapSpeak(text, k)} aria-label={speakingKey === k ? T.stop : T.listen}
+        className={`shrink-0 rounded-full ${big ? "p-2" : "p-2.5"} transition ${speakingKey === k ? "bg-amber-400 text-slate-900" : "bg-slate-800 text-slate-300 hover:text-amber-300"}`}>
+        <Volume2 size={big ? 16 : 15} className={speakingKey === k ? "animate-pulse" : ""} />
+      </button>
+    ) : null;
+
+  const Player = ({ g, side }) => {
+    const p = side === "w" ? g.white : g.black;
+    return (
+      <div className="flex items-center gap-2 px-1 py-1.5 text-sm">
+        <span className={`h-3.5 w-3.5 rounded-sm border ${side === "w" ? "bg-stone-100 border-stone-300" : "bg-slate-950 border-slate-600"}`} />
+        <span className="font-medium text-slate-100">{p.username}</span>
+        {p.rating !== "" && <span className="text-slate-400">{p.rating}</span>}
+      </div>
+    );
+  };
+
+  const liveText = sel ? remark(pos, idx, lang) : "";
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-200">
+      <div className="mx-auto w-full max-w-md px-4 pb-10 pt-6">
+        <header className="mb-5 flex items-center gap-2.5">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-400 text-slate-900"><Crown size={22} /></div>
+          <div className="min-w-0 flex-1">
+            <h1 className="truncate text-lg font-semibold leading-tight text-white" style={{ fontFamily: "Georgia, serif" }}>{T.title}</h1>
+            <p className="truncate text-xs text-slate-400">{T.sub}</p>
+          </div>
+          <div role="group" aria-label={T.langAria} className="flex shrink-0 overflow-hidden rounded-lg border border-slate-700 text-xs font-semibold">
+            {["ru", "en"].map((l) => (
+              <button key={l} onClick={() => changeLang(l)} aria-pressed={lang === l}
+                className={`px-2.5 py-2.5 ${lang === l ? "bg-amber-400 text-slate-900" : "bg-slate-900 text-slate-300 hover:text-white"}`}>
+                {l.toUpperCase()}
+              </button>
+            ))}
+          </div>
+          <button onClick={toggleSound} disabled={!canSpeak} aria-label={!canSpeak ? T.soundNo : sound ? T.soundOn : T.soundOff} aria-pressed={sound}
+            className={`shrink-0 rounded-lg border p-2.5 transition disabled:opacity-40 ${sound ? "border-amber-400 bg-amber-400 text-slate-900" : "border-slate-700 bg-slate-900 text-slate-300 hover:text-white"}`}>
+            {sound ? <Volume2 size={18} /> : <VolumeX size={18} />}
+          </button>
+        </header>
+
+        {!sel && (
+          <>
+            <div className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+              <label className="mb-2 block text-sm text-slate-300">{T.nick}</label>
+              <div className="flex gap-2">
+                <input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && load()}
+                  placeholder={T.ph} autoCapitalize="none" autoCorrect="off"
+                  className="min-w-0 flex-1 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-white placeholder-slate-500 outline-none focus:border-amber-400" />
+                <button onClick={load} disabled={loading || !name.trim()}
+                  className="flex items-center gap-1.5 rounded-xl bg-amber-400 px-4 text-sm font-semibold text-slate-900 transition hover:bg-amber-300 disabled:opacity-40">
+                  {loading ? <Loader2 size={16} className="animate-spin" /> : <Search size={16} />} {T.find}
+                </button>
+              </div>
+              {error && (
+                <div className="mt-3 flex gap-2 rounded-xl bg-rose-500/10 p-3 text-sm text-rose-300">
+                  <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+                  <span>{typeof T.e[error.k] === "function" ? T.e[error.k](error.s) : T.e[error.k]}</span>
+                </div>
+              )}
+              <button onClick={() => { setUser(""); open(DEMO); }} className="mt-3 flex items-center gap-1.5 text-sm text-slate-400 hover:text-amber-300">
+                <Play size={14} /> {T.demo}
+              </button>
+            </div>
+
+            {games && (
+              <div className="mt-5">
+                <h2 className="mb-2 px-1 text-sm text-slate-400">{T.recent} · {games.length}</h2>
+                {games.length === 0 && <p className="px-1 text-sm text-slate-500">{T.none}</p>}
+                <ul className="space-y-2">
+                  {games.map((g, i) => {
+                    const mine = g.white.username.toLowerCase() === user ? g.white : g.black, op = mine === g.white ? g.black : g.white, o = outcome(g);
+                    return (
+                      <li key={i}>
+                        <button onClick={() => open(g)} className="flex w-full items-center gap-3 rounded-xl border border-slate-800 bg-slate-900 p-3 text-left transition hover:border-amber-400/60">
+                          <span className={`h-4 w-4 shrink-0 rounded-sm border ${mine === g.white ? "bg-stone-100 border-stone-300" : "bg-slate-950 border-slate-600"}`} />
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate text-sm font-medium text-white">{op.username} <span className="font-normal text-slate-400">{op.rating}</span></span>
+                            <span className="flex items-center gap-1 text-xs text-slate-500"><Clock size={11} />{g.time_class} · {new Date(g.end_time * 1000).toLocaleDateString(T.locale, { day: "numeric", month: "short" })}</span>
+                          </span>
+                          <span className={`rounded-lg px-2 py-1 text-xs font-medium ${RES_STYLE[o]}`}>{T.res[o]}</span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            )}
+          </>
+        )}
+
+        {sel && (
+          <div>
+            <button onClick={() => { stopSpeech(); setSel(null); }} className="mb-3 flex items-center gap-1.5 text-sm text-slate-400 hover:text-white"><ArrowLeft size={16} /> {T.back}</button>
+            {opening && <p className="mb-2 px-1 text-sm text-amber-300">{opening}</p>}
+            <Player g={sel} side={flip ? "w" : "b"} />
+            <Board s={pos[idx].s} flip={flip} />
+            <Player g={sel} side={flip ? "b" : "w"} />
+
+            <div className="mt-2 flex items-center gap-2">
+              <button onClick={() => go(0)} aria-label={T.first} className="rounded-xl bg-slate-900 p-3 text-slate-300 hover:bg-slate-800"><ChevronsLeft size={18} /></button>
+              <button onClick={() => go(idx - 1)} className="flex flex-1 items-center justify-center gap-1 rounded-xl bg-slate-800 py-3 text-sm font-medium text-white hover:bg-slate-700"><ChevronLeft size={18} /> {T.prev}</button>
+              <button onClick={() => go(idx + 1)} className="flex flex-1 items-center justify-center gap-1 rounded-xl bg-amber-400 py-3 text-sm font-semibold text-slate-900 hover:bg-amber-300">{T.next} <ChevronRight size={18} /></button>
+              <button onClick={() => go(pos.length - 1)} aria-label={T.last} className="rounded-xl bg-slate-900 p-3 text-slate-300 hover:bg-slate-800"><ChevronsRight size={18} /></button>
+            </div>
+
+            <div ref={movesRef} className="relative mt-3 flex gap-1 overflow-x-auto pb-2">
+              {pos.slice(1).map((p, k) => {
+                const i = k + 1;
+                return (
+                  <button key={i} data-i={i} onClick={() => go(i)}
+                    className={`shrink-0 rounded-lg px-2 py-1 text-xs ${i === idx ? "bg-amber-400 font-semibold text-slate-900" : "bg-slate-900 text-slate-300 hover:bg-slate-800"}`}>
+                    {i % 2 ? `${(i + 1) / 2}. ` : ""}{p.san}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="mt-3 overflow-hidden rounded-2xl border border-slate-800 bg-slate-900">
+              <div className="flex items-start gap-2 border-b border-slate-800 bg-slate-900 p-3 text-sm">
+                <Sparkles size={16} className="mt-2.5 shrink-0 text-amber-400" />
+                <p className="min-w-0 flex-1 pt-2">
+                  <span className="font-semibold text-white">{idx ? T.moveLbl(Math.ceil(idx / 2), pos[idx].san) : T.startLbl}.</span>{" "}
+                  <span className="text-slate-300">{liveText}</span>
+                </p>
+                <SpeakBtn text={liveText} k="live" />
+              </div>
+
+              <div ref={chatRef} className="flex h-60 flex-col gap-2 overflow-y-auto p-3">
+                {chat.map((m, i) =>
+                  m.f === "me" ? (
+                    <div key={i} className="max-w-[85%] self-end rounded-2xl rounded-br-md bg-amber-400 px-3 py-2 text-sm text-slate-900">{m.t}</div>
+                  ) : (
+                    <div key={i} className="flex max-w-[92%] items-end gap-1.5 self-start">
+                      <div className="rounded-2xl rounded-bl-md bg-slate-800 px-3 py-2 text-sm text-slate-100">{coachText(m)}</div>
+                      <SpeakBtn text={coachText(m)} k={`c${i}`} />
+                    </div>
+                  )
+                )}
+                {typing && <div className="self-start rounded-2xl rounded-bl-md bg-slate-800 px-3 py-2 text-sm text-slate-400">{T.think}</div>}
+              </div>
+
+              <div className="flex gap-2 overflow-x-auto px-3 pb-2">
+                {Object.entries(T.chips).map(([intent, label]) => (
+                  <button key={intent} onClick={() => send(label, intent)} className="shrink-0 rounded-full border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-amber-400 hover:text-amber-300">{label}</button>
+                ))}
+              </div>
+              <div className="flex gap-2 border-t border-slate-800 p-3">
+                <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && send(input)}
+                  placeholder={T.ask} className="min-w-0 flex-1 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white placeholder-slate-500 outline-none focus:border-amber-400" />
+                <button onClick={() => send(input)} aria-label={T.send} className="rounded-xl bg-amber-400 px-3 text-slate-900 hover:bg-amber-300"><Send size={16} /></button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
